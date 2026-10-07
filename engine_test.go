@@ -11,7 +11,7 @@ import (
 
 var t0 = time.Date(2026, 9, 28, 10, 0, 0, 0, time.UTC)
 
-// dumpState 在单测日志中打印水位线、消费位点与聚合状态快照。
+// dumpState 在单测日志中打印水位线、各分区消费位置/水位线状态与聚合状态快照。
 func dumpState(t *testing.T, tag string, p *Processor, r *Runner) {
 	t.Helper()
 	var offs map[int]int64
@@ -20,14 +20,21 @@ func dumpState(t *testing.T, tag string, p *Processor, r *Runner) {
 	} else {
 		offs = map[int]int64{}
 	}
-	offKeys := make([]int, 0, len(offs))
-	for k := range offs {
-		offKeys = append(offKeys, k)
-	}
-	sort.Ints(offKeys)
 	t.Logf("[%s] watermark=%s", tag, p.Watermark().Format(time.RFC3339Nano))
-	for _, k := range offKeys {
-		t.Logf("[%s] consumed-position partition=%d next-offset=%d", tag, k, offs[k])
+	for _, st := range p.PartitionStatuses() {
+		last := "-"
+		if !st.LastEvent.IsZero() {
+			last = st.LastEvent.Format("15:04:05.000")
+		}
+		idleAt := "-"
+		if !st.IdleAt.IsZero() {
+			idleAt = st.IdleAt.Format("15:04:05.000")
+		}
+		t.Logf("[%s] partition=%d state=%s contributes=%v part-watermark=%s max-event=%s last-event=%s idle-since=%s next-offset=%d",
+			tag, st.Partition, st.State, st.Contributes,
+			st.Watermark.Format("15:04:05.000"),
+			st.MaxEvent.Format("15:04:05.000"), last, idleAt,
+			offValue(offs, st.Partition))
 	}
 	ags := p.Aggregates()
 	wks := make([]WindowKey, 0, len(ags))
@@ -51,6 +58,14 @@ func dumpState(t *testing.T, tag string, p *Processor, r *Runner) {
 			tag, s.Record.Partition, s.Record.Offset,
 			s.Record.Event.EventTime.Format("15:04:05"), s.Reason)
 	}
+}
+
+// offValue 安全读取某分区的"下一个待处理 offset"，未注册分区显示 -1。
+func offValue(offs map[int]int64, partition int) int64 {
+	if v, ok := offs[partition]; ok {
+		return v
+	}
+	return -1
 }
 
 func eventually(timeout time.Duration, fn func() bool) bool {
@@ -347,9 +362,12 @@ func TestConcurrentRebalanceExactlyOnce(t *testing.T) {
 		t.Fatalf("want ErrPartitionNotAssigned, got %v", err)
 	}
 
-	// 一条 t=15s 的关闭事件推进水位线，触发窗口最终结果，且只触发一次。
-	if err := src.ProduceNonBlocking(Record{Partition: 0, Event: Event{Key: "k", EventTime: t0.Add(15 * time.Second), Value: 0}}); err != nil {
-		t.Fatal(err)
+	// 关闭事件必须每个活跃分区都到：全局水位线取各分区水位线的最小值。
+	// （分区冷热不均时，一个分区跑得快不能替其它分区宣布"事件到齐"。）
+	for _, part := range []int{0, 1} {
+		if err := src.ProduceNonBlocking(Record{Partition: part, Event: Event{Key: "k", EventTime: t0.Add(15 * time.Second), Value: 0}}); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if !eventually(2*time.Second, func() bool { return len(proc.Results()) == 1 }) {
 		t.Fatalf("want exactly 1 final result under concurrency/rebalance, got %d", len(proc.Results()))

@@ -14,12 +14,13 @@ import (
 // 三者原子地一起保存，恢复后聚合状态与消费位置严格对得上：
 // 位点语义为"下一个待处理 offset"，与快照中已计入的记录一一对应。
 type Checkpoint struct {
-	ID         int64
-	CreatedAt  time.Time
-	Watermark  time.Time
-	MaxTS      time.Time
-	Offsets    map[int]int64 // partition -> 下一个待处理 offset
-	Aggregates map[WindowKey]*Aggregate
+	ID           int64
+	CreatedAt    time.Time
+	Watermark    time.Time
+	MaxTS        time.Time
+	Offsets      map[int]int64 // partition -> 下一个待处理 offset
+	PartitionWMs map[int]*PartitionWM
+	Aggregates   map[WindowKey]*Aggregate
 }
 
 // CheckpointStore 断点存储。
@@ -39,14 +40,21 @@ type jsonAggEntry struct {
 	Agg   *Aggregate `json:"agg"`
 }
 
+// jsonPartWMEntry 是断点 JSON 中分区水位线条目的表示（map 键拍平）。
+type jsonPartWMEntry struct {
+	Partition int          `json:"partition"`
+	WM        *PartitionWM `json:"wm"`
+}
+
 // jsonCheckpoint 是 Checkpoint 的 JSON 表示。
 type jsonCheckpoint struct {
-	ID         int64          `json:"id"`
-	CreatedAt  time.Time      `json:"createdAt"`
-	Watermark  time.Time      `json:"watermark"`
-	MaxTS      time.Time      `json:"maxTs"`
-	Offsets    map[int]int64  `json:"offsets"`
-	Aggregates []jsonAggEntry `json:"aggregates"`
+	ID           int64             `json:"id"`
+	CreatedAt    time.Time         `json:"createdAt"`
+	Watermark    time.Time         `json:"watermark"`
+	MaxTS        time.Time         `json:"maxTs"`
+	Offsets      map[int]int64     `json:"offsets"`
+	PartitionWMs []jsonPartWMEntry `json:"partitionWMs"`
+	Aggregates   []jsonAggEntry    `json:"aggregates"`
 }
 
 // MarshalJSON 自定义序列化，拍平 WindowKey 键。
@@ -62,12 +70,21 @@ func (cp *Checkpoint) MarshalJSON() ([]byte, error) {
 		return keys[i].Key < keys[j].Key
 	})
 	jc := jsonCheckpoint{
-		ID:         cp.ID,
-		CreatedAt:  cp.CreatedAt,
-		Watermark:  cp.Watermark,
-		MaxTS:      cp.MaxTS,
-		Offsets:    cp.Offsets,
-		Aggregates: make([]jsonAggEntry, 0, len(keys)),
+		ID:           cp.ID,
+		CreatedAt:    cp.CreatedAt,
+		Watermark:    cp.Watermark,
+		MaxTS:        cp.MaxTS,
+		Offsets:      cp.Offsets,
+		PartitionWMs: make([]jsonPartWMEntry, 0, len(cp.PartitionWMs)),
+		Aggregates:   make([]jsonAggEntry, 0, len(keys)),
+	}
+	partIDs := make([]int, 0, len(cp.PartitionWMs))
+	for id := range cp.PartitionWMs {
+		partIDs = append(partIDs, id)
+	}
+	sort.Ints(partIDs)
+	for _, id := range partIDs {
+		jc.PartitionWMs = append(jc.PartitionWMs, jsonPartWMEntry{Partition: id, WM: cp.PartitionWMs[id]})
 	}
 	for _, k := range keys {
 		jc.Aggregates = append(jc.Aggregates, jsonAggEntry{Key: k.Key, Start: k.Start, Agg: cp.Aggregates[k]})
@@ -89,6 +106,10 @@ func (cp *Checkpoint) UnmarshalJSON(data []byte) error {
 	if cp.Offsets == nil {
 		cp.Offsets = map[int]int64{}
 	}
+	cp.PartitionWMs = make(map[int]*PartitionWM, len(jc.PartitionWMs))
+	for _, e := range jc.PartitionWMs {
+		cp.PartitionWMs[e.Partition] = e.WM
+	}
 	cp.Aggregates = make(map[WindowKey]*Aggregate, len(jc.Aggregates))
 	for _, e := range jc.Aggregates {
 		cp.Aggregates[WindowKey{Key: e.Key, Start: e.Start}] = e.Agg
@@ -99,15 +120,20 @@ func (cp *Checkpoint) UnmarshalJSON(data []byte) error {
 // cloneCheckpoint 深拷贝，避免调用方在保存后修改快照内容。
 func cloneCheckpoint(cp *Checkpoint) *Checkpoint {
 	cp2 := &Checkpoint{
-		ID:         cp.ID,
-		CreatedAt:  cp.CreatedAt,
-		Watermark:  cp.Watermark,
-		MaxTS:      cp.MaxTS,
-		Offsets:    make(map[int]int64, len(cp.Offsets)),
-		Aggregates: make(map[WindowKey]*Aggregate, len(cp.Aggregates)),
+		ID:           cp.ID,
+		CreatedAt:    cp.CreatedAt,
+		Watermark:    cp.Watermark,
+		MaxTS:        cp.MaxTS,
+		Offsets:      make(map[int]int64, len(cp.Offsets)),
+		PartitionWMs: make(map[int]*PartitionWM, len(cp.PartitionWMs)),
+		Aggregates:   make(map[WindowKey]*Aggregate, len(cp.Aggregates)),
 	}
 	for k, v := range cp.Offsets {
 		cp2.Offsets[k] = v
+	}
+	for k, v := range cp.PartitionWMs {
+		wm := *v
+		cp2.PartitionWMs[k] = &wm
 	}
 	for k, v := range cp.Aggregates {
 		cp2.Aggregates[k] = v.clone()
