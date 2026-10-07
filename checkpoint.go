@@ -18,7 +18,8 @@ type Checkpoint struct {
 	CreatedAt  time.Time
 	Watermark  time.Time
 	MaxTS      time.Time
-	Offsets    map[int]int64 // partition -> 下一个待处理 offset
+	Offsets    map[int]int64     // partition -> 下一个待处理 offset
+	Partitions map[int]time.Time // partition -> 该分区已观测的最大事件时间（恢复每分区水位线用）
 	Aggregates map[WindowKey]*Aggregate
 }
 
@@ -41,12 +42,13 @@ type jsonAggEntry struct {
 
 // jsonCheckpoint 是 Checkpoint 的 JSON 表示。
 type jsonCheckpoint struct {
-	ID         int64          `json:"id"`
-	CreatedAt  time.Time      `json:"createdAt"`
-	Watermark  time.Time      `json:"watermark"`
-	MaxTS      time.Time      `json:"maxTs"`
-	Offsets    map[int]int64  `json:"offsets"`
-	Aggregates []jsonAggEntry `json:"aggregates"`
+	ID         int64             `json:"id"`
+	CreatedAt  time.Time         `json:"createdAt"`
+	Watermark  time.Time         `json:"watermark"`
+	MaxTS      time.Time         `json:"maxTs"`
+	Offsets    map[int]int64     `json:"offsets"`
+	Partitions map[int]time.Time `json:"partitions,omitempty"`
+	Aggregates []jsonAggEntry    `json:"aggregates"`
 }
 
 // MarshalJSON 自定义序列化，拍平 WindowKey 键。
@@ -67,6 +69,7 @@ func (cp *Checkpoint) MarshalJSON() ([]byte, error) {
 		Watermark:  cp.Watermark,
 		MaxTS:      cp.MaxTS,
 		Offsets:    cp.Offsets,
+		Partitions: cp.Partitions,
 		Aggregates: make([]jsonAggEntry, 0, len(keys)),
 	}
 	for _, k := range keys {
@@ -89,6 +92,10 @@ func (cp *Checkpoint) UnmarshalJSON(data []byte) error {
 	if cp.Offsets == nil {
 		cp.Offsets = map[int]int64{}
 	}
+	cp.Partitions = jc.Partitions
+	if cp.Partitions == nil {
+		cp.Partitions = map[int]time.Time{}
+	}
 	cp.Aggregates = make(map[WindowKey]*Aggregate, len(jc.Aggregates))
 	for _, e := range jc.Aggregates {
 		cp.Aggregates[WindowKey{Key: e.Key, Start: e.Start}] = e.Agg
@@ -104,10 +111,14 @@ func cloneCheckpoint(cp *Checkpoint) *Checkpoint {
 		Watermark:  cp.Watermark,
 		MaxTS:      cp.MaxTS,
 		Offsets:    make(map[int]int64, len(cp.Offsets)),
+		Partitions: make(map[int]time.Time, len(cp.Partitions)),
 		Aggregates: make(map[WindowKey]*Aggregate, len(cp.Aggregates)),
 	}
 	for k, v := range cp.Offsets {
 		cp2.Offsets[k] = v
+	}
+	for k, v := range cp.Partitions {
+		cp2.Partitions[k] = v
 	}
 	for k, v := range cp.Aggregates {
 		cp2.Aggregates[k] = v.clone()

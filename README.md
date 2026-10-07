@@ -15,9 +15,10 @@
 go test -race -count=1 -v ./...
 ```
 
-`-v` 日志会在关键节点打印三类信息（见下文"可观测性"）：
+`-v` 日志会在关键节点打印四类信息（见下文"可观测性"）：
 
 - 当前**水位线**（watermark）；
+- 各分区**水位状态**（最大事件时间、贡献值、是否空闲、是否正拖住水位线）；
 - 各分区**消费位置**（下一个待处理 offset）；
 - **状态快照**（每个 keyed window 的 count/sum/fired/revision）与侧输出。
 
@@ -34,15 +35,37 @@ go test -race -count=1 -v ./...
 
 ## 二、水位线与迟到数据规则
 
-### 水位线
+### 水位线（按分区推进）
 
 ```
-watermark = maxObservedEventTime − maxOutOfOrderness
+partitionContribution[p] = maxObservedEventTime[p] − maxOutOfOrderness
+watermark = min over 活跃分区 partitionContribution[p]
 ```
 
-- 水位线**单调不减**，由观测到的最大事件时间减去固定的乱序容忍 `maxOutOfOrderness` 得到；
+- 水位线**单调不减**；
 - 含义：断言"事件时间 `≤ watermark` 的正常事件基本到齐"；
 - 某条事件是否迟到，用**推进水位线之前**的旧水位线判断，当前事件不会改变自己的结论。
+
+**分区进度不齐时的规则**（真实数据源各分区冷热不均）：
+
+1. **跑得快的分区不会单方面推高水位线**：整体水位线取各活跃分区贡献的
+   **最小值**，因此其它分区里正常到达的事件不会被误判成"太迟"甩到一边。
+2. **已注册但暂无数据的分区会拖住水位线**（贡献视为 −∞），直到它首次来数
+   或被判空闲。`Runner` 每个世代启动时按分配自动注册分区；裸用 `Processor`
+   时用 `TrackPartitions(...)` 注册。
+3. **空闲分区**：超过 `idleTimeout`（默认 `DefaultPartitionIdleTimeout = 200ms`，
+   可用 `SetPartitionIdleTimeout` 调整、`<=0` 禁用）未活动的分区被标记为空闲、
+   **暂时退出 min 计算**——长时间无数据的分区不会把水位线永远拖住。
+   空闲检测由 `Runner` 的周期循环自动执行；裸用 `Processor` 时调用
+   `CheckIdle()`（配合 `SetClock` 注入时钟可确定性测试）。
+4. **全部空闲（整体输入静默）**：水位线追平各分区贡献的**最大值**，让窗口
+   得以关闭，不会"数据一停窗口永远发不出"。
+5. **空闲分区恢复来数**：重新加入 min 计算，但水位线**绝不回退**；其"补交"
+   的旧事件按既有的乱序容忍 + 允许迟到规则判定（可容忍则修订，超容忍则侧输出，
+   侧输出记录判定时的水位线便于排查）。
+
+`PartitionWatermarks()` 暴露每个分区的状态（最大事件时间、贡献值、是否空闲、
+是否正在拖住水位线），测试日志里可直接区分**跑得快 / 跑得慢 / 彻底空闲**。
 
 ### 迟到数据的两级容忍（结论可区分，绝不静默处理）
 
@@ -63,7 +86,9 @@ watermark = maxObservedEventTime − maxOutOfOrderness
 - 超出容忍的事件**既不丢、也不计数**：可在侧输出中查询到原因 `ErrLateBeyondTolerance`；
   它同时被登记为"已处理"，重试不会造成反复侧输出。
 
-对应测试：`TestOutOfOrderAndLateness`、`TestDuplicateConsumption`。
+对应测试：`TestOutOfOrderAndLateness`、`TestDuplicateConsumption`、
+`TestUnevenPartitionProgress`（冷热不均）、`TestIdlePartitionDoesNotBlockWatermark`
+（空闲分区）、`TestAllPartitionsIdleWatermarkCatchesUp`（整体静默追平）。
 
 ## 三、数据源、背压与消费位置
 
@@ -80,15 +105,26 @@ watermark = maxObservedEventTime − maxOutOfOrderness
 
 ## 四、断点（checkpoint）语义
 
-`Checkpoint` 是一个一致性快照，三者原子地一起保存：
+`Checkpoint` 是一个一致性快照，四者原子地一起保存：
 
 ```
-Checkpoint { ID, Watermark, MaxTS, Offsets: partition->next-offset, Aggregates }
+Checkpoint { ID, Watermark, MaxTS,
+             Offsets:    partition -> next-offset,
+             Partitions: partition -> 该分区已观测的最大事件时间,
+             Aggregates }
 ```
 
-- 状态（窗口聚合）与消费位置在**同一份快照**里，恢复后严格对齐；
+- **一致性保证的核心**：各分区消费位点由 `Processor` 在与聚合状态**同一把锁**内
+  推进，`Snapshot` 因此在同一瞬间原子捕获"状态 + 位点 + 水位线"——
+  **无论断点落在处理的哪一时刻**，三者都严格对得上：恢复后重放只会命中幂等防线，
+  不会重复计数，也不会漏记录（`TestFrequentCheckpointsConcurrentConsistency`
+  对处理中途保存的每一个采样断点做"恢复 + 重放"验证）；
 - `CheckpointStore.Save` 要求 ID 单调：用更旧的 ID 覆盖更新的断点 →
-  返回 `ErrCheckpointRollback`，**断点回退被明确拒绝**；
+  返回 `ErrCheckpointRollback`，**断点回退被明确拒绝**；恢复时若断点中的位点
+  比源已提交位点更旧，同样以 `ErrOffsetRollback` 拒绝
+  （`TestRecoverRejectsCheckpointOlderThanCommitted`）；
+- **高频打点不拖慢处理**：若自上次断点以来位点与水位线都没有变化，
+  `Runner.Checkpoint` 跳过本次保存，不产生无效存储写；
 - 两种存储：
   - `MemoryCheckpointStore`：同进程内模拟持久化；
   - `FileCheckpointStore`：JSON 文件 + 临时文件原子 rename + fsync，
@@ -140,8 +176,30 @@ Checkpoint { ID, Watermark, MaxTS, Offsets: partition->next-offset, Aggregates }
 结合"位点对齐 + 处理器幂等"，在并发摄入、周期性断点和多次消费组调整下，
 每个窗口的最终结果保持**恰好一次**。
 
+### 整批换人（发版全量替换实例）
+
+两种换法都能跑，且结果与"全程只用一个消费者"一致：
+
+1. **同一运行器内整批换成员**：老成员全部 `Leave`、新成员全部 `Join`（世代推进），
+   `Rebalance` 走"停止旧世代 → 断点 → 位点对齐 → 启动新世代"流程
+   （`TestFullMemberSwapRebalance`）；
+2. **全新实例恢复**：老实例全部停止（`Stop` 落最终断点），新一批实例用
+   **新的 Processor/Runner** 从共享断点存储 `Recover` 后继续
+   （`TestFullConsumerGroupReplacementViaRecovery`，含与单消费者对照组逐窗口比对）。
+
+恢复兼容范围：
+
+- 断点中包含每分区最大事件时间，新实例恢复后**每分区水位线**原样接续，
+  不会因为换人而把正常事件误判迟到；
+- 已发出的窗口最终结果**不会重发**（`Fired` 标记随断点恢复），
+  允许迟到期内的迟到事件继续产生 `Revision` 递增的修订结果；
+- 恢复方必须使用与写入方相同的窗口大小、乱序容忍与允许迟到配置
+  （这些参数不随断点保存，属于任务定义）；
+- 只增减部分成员的普通再均衡与整批换人走同一条路径，同样被覆盖。
+
 对应测试：`TestConcurrentRebalanceExactlyOnce`（2 分区、3 个成员两次再均衡、
-周期断点并存，最终校验 `count/sum` 与单条结果）。
+周期断点并存，最终校验 `count/sum` 与单条结果）、
+`TestFullMemberSwapRebalance`、`TestFullConsumerGroupReplacementViaRecovery`。
 
 ## 六、恰好一次的保证范围与边界
 
@@ -162,7 +220,9 @@ Checkpoint { ID, Watermark, MaxTS, Offsets: partition->next-offset, Aggregates }
 - `FileCheckpointStore` 保证单文件原子替换，未实现跨多文件的分布式事务；
 - 水位线是经典的"有界乱序"启发式：超出 `maxOutOfOrderness + allowedLateness`
   的迟到数据不进聚合，而是进侧输出（可补偿、可解释），并非无限等待；
-- 窗口触发依赖水位线推进；若数据完全停止，需要额外的空闲超时触发策略（本库未内置）。
+- 空闲检测基于处理时间（processing time）：分区静默超过 `idleTimeout` 即被判空闲；
+  若它之后又产出很旧的事件，这些事件会按迟到规则进入修订或侧输出——
+  这是"不被空闲分区拖死"的必然取舍，侧输出中的判定水位线可用于对账。
 
 ## 七、可区分的失败原因速查
 
@@ -182,10 +242,14 @@ Checkpoint { ID, Watermark, MaxTS, Offsets: partition->next-offset, Aggregates }
 
 ```
 [tag] watermark=<RFC3339>
+[tag] partition-watermark partition=<p> hasData=.. maxEventTime=.. contribution=.. idle=.. holdsWatermark=..
 [tag] consumed-position partition=<p> next-offset=<n>
 [tag] state key=<k> window=[start,end) count=.. sum=.. fired=.. revision=..
 [tag] side-output partition=.. offset=.. eventTime=.. reason=..
 ```
+
+其中 `partition-watermark` 行直接标明每个分区是**跑得快、跑得慢
+（`holdsWatermark=true`，正在拖住整体水位线）还是空闲（`idle=true`）**。
 
 对应覆盖：
 
@@ -194,8 +258,14 @@ Checkpoint { ID, Watermark, MaxTS, Offsets: partition->next-offset, Aggregates }
 | 乱序到达、两级迟到 | `TestOutOfOrderAndLateness` |
 | 重复消费幂等 | `TestDuplicateConsumption` |
 | 背压不丢数 | `TestBackpressureNoLoss` |
-| 断点/位点回退被拒 | `TestRollbackRejected` |
+| 断点/位点回退被拒 | `TestRollbackRejected`、`TestRecoverRejectsCheckpointOlderThanCommitted` |
 | 重启恢复（文件断点） | `TestRestartRecoveryFromFile` |
 | 并发 + 多次再均衡恰好一次 | `TestConcurrentRebalanceExactlyOnce` |
+| 分区冷热不均 | `TestUnevenPartitionProgress` |
+| 分区空闲不拖死水位线 | `TestIdlePartitionDoesNotBlockWatermark` |
+| 整体静默水位线追平 | `TestAllPartitionsIdleWatermarkCatchesUp` |
+| 整批换人（同运行器换成员） | `TestFullMemberSwapRebalance` |
+| 整批换人（新实例断点恢复） | `TestFullConsumerGroupReplacementViaRecovery` |
+| 高频断点 + 并发处理一致性 | `TestFrequentCheckpointsConcurrentConsistency` |
 
 压测稳定性：`go test -race -count=N ./...`。

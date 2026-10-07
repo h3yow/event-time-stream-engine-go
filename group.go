@@ -132,7 +132,8 @@ type Runner struct {
 	mu           sync.Mutex
 	gen          int64
 	assignment   *Assignment
-	offsets      map[int]int64 // partition -> 下一个待处理 offset
+	offsets      map[int]int64 // partition -> 下一个待处理 offset（镜像，用于再均衡 Seek 对齐与日志）
+	lastCp       *Checkpoint   // 上次成功保存的断点（无进展时跳过高频打点）
 	nextCpID     int64
 	cancel       context.CancelFunc
 	tickerCancel context.CancelFunc
@@ -209,16 +210,20 @@ func (r *Runner) startGenerationLocked(ass *Assignment) {
 	r.cancel = cancel
 	r.running = true
 
+	// 注册本世代涉及的全部分区：暂无数据的分区会拖住水位线，直到来数或被判空闲。
+	var all []int
 	for member, parts := range ass.Partitions {
+		all = append(all, parts...)
 		for _, p := range parts {
 			r.wg.Add(1)
 			go r.consume(ctx, ass.Generation, member, p)
 		}
 	}
+	r.proc.TrackPartitions(all...)
 
 	tctx, tcancel := context.WithCancel(context.Background())
 	r.tickerCancel = tcancel
-	go r.checkpointLoop(tctx)
+	go r.tickLoop(tctx)
 }
 
 func (r *Runner) consume(ctx context.Context, gen int64, member string, partition int) {
@@ -266,25 +271,33 @@ func (r *Runner) Submit(gen int64, rec Record) (ProcessResult, error) {
 	return res, nil
 }
 
-func (r *Runner) checkpointLoop(ctx context.Context) {
-	if r.checkpointEvery <= 0 {
-		<-ctx.Done()
-		return
+// tickLoop 是运行器的周期循环：每次 tick 先做空闲分区检测（水位线可能因此
+// 推进并触发窗口），再按 checkpointEvery 的节奏做断点。
+// 即使未启用周期断点（checkpointEvery<=0），空闲检测也会以默认节奏运行，
+// 保证"长时间无数据的分区不会把水位线永远拖住"。
+func (r *Runner) tickLoop(ctx context.Context) {
+	interval := r.checkpointEvery
+	if interval <= 0 {
+		interval = 50 * time.Millisecond
 	}
-	ticker := time.NewTicker(r.checkpointEvery)
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			_ = r.Checkpoint()
+			r.proc.CheckIdle()
+			if r.checkpointEvery > 0 {
+				_ = r.Checkpoint()
+			}
 		}
 	}
 }
 
-// Checkpoint 触发一致性断点：先保存处理器快照（状态+水位线+位点），
-// 成功后再向源提交位点。顺序保证恢复后最多重放、绝不丢失，且重放幂等。
+// Checkpoint 触发一致性断点：处理器在同一瞬间原子捕获"聚合状态+位点+水位线"，
+// 先保存快照，成功后再向源提交位点。顺序保证恢复后最多重放、绝不丢失，且重放幂等。
+// 若自上次断点以来位点与水位线都没有变化，则跳过本次保存，避免高频打点产生无效写。
 func (r *Runner) Checkpoint() error {
 	r.mu.Lock()
 	if !r.running && r.gen == 0 {
@@ -293,25 +306,41 @@ func (r *Runner) Checkpoint() error {
 	}
 	id := r.nextCpID
 	r.nextCpID++
-	offsets := make(map[int]int64, len(r.offsets))
-	for p, off := range r.offsets {
-		offsets[p] = off
+	r.mu.Unlock()
+
+	cp := r.proc.Snapshot(id)
+
+	r.mu.Lock()
+	if r.lastCp != nil && r.lastCp.Watermark.Equal(cp.Watermark) && offsetsEqual(r.lastCp.Offsets, cp.Offsets) {
+		r.mu.Unlock()
+		return nil // 无进展：跳过，不消耗存储 IO
 	}
 	r.mu.Unlock()
 
-	cp := r.proc.Snapshot(id, offsets)
 	if err := r.store.Save(cp); err != nil { // 回退断点在此被明确拒绝
-		r.mu.Lock()
-		r.nextCpID--
-		r.mu.Unlock()
 		return err
 	}
-	for p, off := range offsets {
+	r.mu.Lock()
+	r.lastCp = cloneCheckpoint(cp)
+	r.mu.Unlock()
+	for p, off := range cp.Offsets {
 		if err := r.source.Commit(p, off); err != nil { // 位点回退在此被明确拒绝
 			return err
 		}
 	}
 	return nil
+}
+
+func offsetsEqual(a, b map[int]int64) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if bv, ok := b[k]; !ok || bv != v {
+			return false
+		}
+	}
+	return true
 }
 
 // Rebalance 切换到新世代分配：优雅停止旧 goroutine -> 断点 -> 位点对齐 -> 启动。

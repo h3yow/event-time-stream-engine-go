@@ -26,6 +26,11 @@ func dumpState(t *testing.T, tag string, p *Processor, r *Runner) {
 	}
 	sort.Ints(offKeys)
 	t.Logf("[%s] watermark=%s", tag, p.Watermark().Format(time.RFC3339Nano))
+	for _, ps := range p.PartitionWatermarks() {
+		t.Logf("[%s] partition-watermark partition=%d hasData=%v maxEventTime=%s contribution=%s idle=%v holdsWatermark=%v",
+			tag, ps.Partition, ps.HasData, ps.MaxEventTime.Format("15:04:05"),
+			ps.Contribution.Format("15:04:05"), ps.Idle, ps.HoldsWatermark)
+	}
 	for _, k := range offKeys {
 		t.Logf("[%s] consumed-position partition=%d next-offset=%d", tag, k, offs[k])
 	}
